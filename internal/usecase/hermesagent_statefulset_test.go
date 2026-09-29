@@ -29,6 +29,101 @@ func minimalHA() *agentsv1alpha1.HermesAgent {
 	}
 }
 
+// imageJSON wraps a raw JSON image override (string or legacy object form).
+func imageJSON(raw string) *apiextensionsv1.JSON {
+	return &apiextensionsv1.JSON{Raw: []byte(raw)}
+}
+
+func TestGetImageReferenceForms(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "string with tag", raw: `"nousresearch/hermes-agent:v1.2.3"`, want: "nousresearch/hermes-agent:v1.2.3"},
+		{name: "string with digest", raw: `"nousresearch/hermes-agent@sha256:abc123"`, want: "nousresearch/hermes-agent@sha256:abc123"},
+		{name: "string with registry port and digest", raw: `"registry.example.com:5000/agent@sha256:abc123"`, want: "registry.example.com:5000/agent@sha256:abc123"},
+		{name: "legacy object", raw: `{"repository":"my/agent","tag":"v2"}`, want: "my/agent:v2"},
+		{name: "legacy repository only", raw: `{"repository":"my/agent"}`, want: "my/agent:latest"},
+		{name: "legacy tag only", raw: `{"tag":"v2"}`, want: "nousresearch/hermes-agent:v2"},
+		{name: "empty string", raw: `""`, want: "nousresearch/hermes-agent:latest"},
+		{name: "nil", raw: "", want: "nousresearch/hermes-agent:latest"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ha := minimalHA()
+			if tt.raw != "" {
+				ha.Spec.Hermes = &agentsv1alpha1.Hermes{Image: imageJSON(tt.raw)}
+			}
+			if got := ha.GetHermes().GetImage(); got != tt.want {
+				t.Errorf("GetImage() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDigestPinnedImageInPod(t *testing.T) {
+	ha := minimalHA()
+	ha.Spec.Hermes = &agentsv1alpha1.Hermes{Image: imageJSON(`"nousresearch/hermes-agent@sha256:abc123"`)}
+	sts := buildStatefulSet(ha)
+	for _, c := range sts.Spec.Template.Spec.Containers {
+		if c.Name != "hermes-agent" {
+			continue
+		}
+		if c.Image != "nousresearch/hermes-agent@sha256:abc123" {
+			t.Errorf("hermes-agent image = %q, want digest reference", c.Image)
+		}
+		return
+	}
+	t.Errorf("hermes-agent container not found in %+v", sts.Spec.Template.Spec.Containers)
+}
+
+func TestUsesLegacyImageForm(t *testing.T) {
+	t.Run("false when unset", func(t *testing.T) {
+		if minimalHA().UsesLegacyImageForm() {
+			t.Error("UsesLegacyImageForm() = true, want false")
+		}
+	})
+
+	t.Run("false when string form", func(t *testing.T) {
+		ha := minimalHA()
+		ha.Spec.Hermes = &agentsv1alpha1.Hermes{Image: imageJSON(`"nousresearch/hermes-agent:v2"`)}
+		ha.Spec.SearXNG = &agentsv1alpha1.SearXNG{Enabled: true, Image: imageJSON(`"searxng/searxng:latest"`)}
+		ha.Spec.Camofox = &agentsv1alpha1.Camofox{Enabled: true, Image: imageJSON(`"camofox:latest"`)}
+		if ha.UsesLegacyImageForm() {
+			t.Error("UsesLegacyImageForm() = true, want false")
+		}
+	})
+
+	t.Run("true when object form", func(t *testing.T) {
+		ha := minimalHA()
+		ha.Spec.Hermes = &agentsv1alpha1.Hermes{Image: imageJSON(`{"repository":"my/agent","tag":"v2"}`)}
+		if !ha.UsesLegacyImageForm() {
+			t.Error("UsesLegacyImageForm() = false, want true")
+		}
+	})
+
+	t.Run("true when sidecar object form", func(t *testing.T) {
+		ha := minimalHA()
+		ha.Spec.SearXNG = &agentsv1alpha1.SearXNG{Enabled: true, Image: imageJSON(`{"tag":"v3"}`)}
+		if !ha.UsesLegacyImageForm() {
+			t.Error("UsesLegacyImageForm() = false, want true")
+		}
+		ha = minimalHA()
+		ha.Spec.Camofox = &agentsv1alpha1.Camofox{Enabled: true, Image: imageJSON(`{"repository":"camofox"}`)}
+		if !ha.UsesLegacyImageForm() {
+			t.Error("UsesLegacyImageForm() = false, want true")
+		}
+	})
+
+	t.Run("false on nil receiver", func(t *testing.T) {
+		var ha *agentsv1alpha1.HermesAgent
+		if ha.UsesLegacyImageForm() {
+			t.Error("UsesLegacyImageForm() = true, want false")
+		}
+	})
+}
+
 func TestDesiredSpecHash(t *testing.T) {
 	t.Run("stable for identical spec", func(t *testing.T) {
 		ha := minimalHA()
@@ -52,7 +147,7 @@ func TestDesiredSpecHash(t *testing.T) {
 	t.Run("changes when pod template changes", func(t *testing.T) {
 		ha := minimalHA()
 		h1 := desiredSpecHash(buildStatefulSet(ha))
-		ha.Spec.Hermes = &agentsv1alpha1.Hermes{Image: &agentsv1alpha1.HermesImage{Tag: "v2"}}
+		ha.Spec.Hermes = &agentsv1alpha1.Hermes{Image: imageJSON(`"nousresearch/hermes-agent:v2"`)}
 		if desiredSpecHash(buildStatefulSet(ha)) == h1 {
 			t.Error("expected different hash when pod template changes")
 		}
